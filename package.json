@@ -1,0 +1,12 @@
+{
+  "name": "apps",
+  "version": "0.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "Kazilsky",
+  "license": "Apache License"
+}
