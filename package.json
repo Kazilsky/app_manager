@@ -8,5 +8,17 @@
   },
   "keywords": [],
   "author": "Kazilsky",
-  "license": "Apache License"
+  "license": "Apache License",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "express": "^4.21.2",
+    "mongoose": "^8.9.5",
+    "node-ssh": "^13.2.0",
+    "os": "^0.1.2",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
 }
