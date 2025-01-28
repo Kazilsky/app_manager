@@ -13,7 +13,7 @@ class WorkerNode {
         this.workerId = null;
         this.deploymentPath = process.env.DEPLOYMENT_PATH || './deployments';
         this.currentUser = 'Kazilsky';
-        this.startTime = '2025-01-23 19:26:36';
+        this.startTime = '2025-01-28 07:14:53';
         this.ensureDeploymentPath();
 
         this.socket = io(mainServerUrl, {
@@ -287,13 +287,13 @@ dist/
         await fs.promises.writeFile(`${deploymentDir}/Dockerfile`, dockerfileContent);
         await fs.promises.writeFile(`${deploymentDir}/.dockerignore`, dockerignore);
 
-        console.log(`[${this.getCurrentTimestamp()}] Created Dockerfile and .dockerignore`);
+        console.log(`[2025-01-28 07:17:23] Created Dockerfile and .dockerignore in ${deploymentDir}`);
     }
 
     async retryDockerBuild(deploymentDir, deploymentId, replicaId, maxAttempts = 3) {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-                console.log(`[${this.getCurrentTimestamp()}] Docker build attempt ${attempt}/${maxAttempts}`);
+                console.log(`[2025-01-28 07:17:23] Docker build attempt ${attempt}/${maxAttempts}`);
 
                 await execPromise('docker system prune -f').catch(() => {});
 
@@ -321,7 +321,7 @@ dist/
 
     async deployProject(deploymentData) {
         const { deploymentDir, repoUrl, replicaId, deploymentId } = deploymentData;
-        console.log(`[${this.getCurrentTimestamp()}] Starting deployment:`, deploymentData);
+        console.log(`[2025-01-28 07:17:23] Starting deployment:`, deploymentData);
 
         try {
             const normalizedUrl = repoUrl
@@ -331,7 +331,7 @@ dist/
 
             await this.cleanup(deploymentDir, deploymentId, replicaId);
 
-            console.log(`[${this.getCurrentTimestamp()}] Cloning repository:`, normalizedUrl);
+            console.log(`[2025-01-28 07:17:23] Cloning repository:`, normalizedUrl);
             const cloneCommand = `git clone --depth 1 https://github.com/${normalizedUrl}.git ${deploymentDir}`;
             await execPromise(cloneCommand);
 
@@ -351,7 +351,7 @@ dist/
             await execPromise(`docker stop app-${deploymentId}-${replicaId}`).catch(() => {});
             await execPromise(`docker rm app-${deploymentId}-${replicaId}`).catch(() => {});
 
-            console.log(`[${this.getCurrentTimestamp()}] Starting container on port ${port}`);
+            console.log(`[2025-01-28 07:17:23] Starting container on port ${port}`);
             const runCommand = `docker run -d \
                 --name app-${deploymentId}-${replicaId} \
                 --network host \
@@ -401,7 +401,7 @@ dist/
 
     async cleanup(deploymentDir, deploymentId, replicaId) {
         try {
-            console.log(`[${this.getCurrentTimestamp()}] Starting cleanup for ${deploymentId}-${replicaId}`);
+            console.log(`[2025-01-28 07:17:23] Starting cleanup for ${deploymentId}-${replicaId}`);
 
             const containerInfo = await execPromise(`docker inspect app-${deploymentId}-${replicaId}`).catch(() => null);
 
@@ -418,7 +418,7 @@ dist/
                 await fs.promises.rm(deploymentDir, { recursive: true, force: true });
             }
 
-            console.log(`[2025-01-23 19:28:25] Cleanup completed for ${deploymentId}-${replicaId}`);
+            console.log(`[2025-01-28 07:17:23] Cleanup completed for ${deploymentId}-${replicaId}`);
 
             if (global.gc) {
                 global.gc();
@@ -429,14 +429,14 @@ dist/
     }
 }
 
-// Initialize worker with current time and user
+// Initialize worker
 const MAIN_SERVER_URL = process.env.MAIN_SERVER_URL || 'http://localhost:3000';
-console.log(`[2025-01-23 19:28:25] Starting worker node for user: Kazilsky`);
+console.log(`[2025-01-28 07:17:23] Starting worker node for user: ${process.env.USER || 'Kazilsky'}`);
 const worker = new WorkerNode(MAIN_SERVER_URL);
 
 // Handle process termination
 process.on('SIGTERM', async () => {
-    console.log(`[2025-01-23 19:28:25] Received SIGTERM. Cleaning up...`);
+    console.log(`[2025-01-28 07:17:23] Received SIGTERM. Cleaning up...`);
     if (worker.socket) {
         worker.socket.close();
     }
@@ -444,7 +444,7 @@ process.on('SIGTERM', async () => {
 });
 
 process.on('SIGINT', async () => {
-    console.log(`[2025-01-23 19:28:25] Received SIGINT. Cleaning up...`);
+    console.log(`[2025-01-28 07:17:23] Received SIGINT. Cleaning up...`);
     if (worker.socket) {
         worker.socket.close();
     }
@@ -453,12 +453,11 @@ process.on('SIGINT', async () => {
 
 // Handle uncaught errors
 process.on('uncaughtException', (error) => {
-    console.error(`[2025-01-23 19:28:25] Uncaught Exception:`, error);
+    console.error(`[2025-01-28 07:17:23] Uncaught Exception:`, error);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    console.error(`[2025-01-23 19:28:25] Unhandled Rejection at:`, promise, 'reason:', reason);
+    console.error(`[2025-01-28 07:17:23] Unhandled Rejection at:`, promise, 'reason:', reason);
 });
 
-// Export worker for testing
 module.exports = WorkerNode;

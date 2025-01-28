@@ -1,84 +1,39 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const mongoose = require('mongoose');
+const Redis = require('ioredis');
 const axios = require('axios');
 const fs = require('fs');
 
-// Schemas
-const WorkerSchema = new mongoose.Schema({
-    hostname: String,
-    socketId: String,
-    status: {
-        type: String,
-        enum: ['active', 'inactive', 'overloaded', 'busy'],
-        default: 'inactive'
-    },
-    lastHeartbeat: {
-        type: Date,
-        default: Date.now
-    },
-    currentLoad: {
-        cpuUsage: Number,
-        memoryUsage: Number,
-        runningContainers: Number
+// Redis connection
+const redis = new Redis({
+    port: 6379,
+    host: 'localhost',
+    retryStrategy: (times) => {
+        const delay = Math.min(times * 50, 2000);
+        return delay;
     }
 });
-
-const DeploymentSchema = new mongoose.Schema({
-    githubRepo: String,
-    userName: String,
-    minReplicas: Number,
-    maxReplicas: Number,
-    status: {
-        type: String,
-        enum: ['pending', 'deploying', 'active', 'failed'],
-        default: 'pending'
-    },
-    lastScaleUp: Date,
-    lastScaleDown: Date,
-    workers: [{
-        workerId: mongoose.Schema.Types.ObjectId,
-        replicaId: Number,
-        status: {
-            type: String,
-            enum: ['pending', 'deploying', 'active', 'failed', 'removing'],
-            default: 'pending'
-        }
-    }],
-    createdAt: {
-        type: Date,
-        default: Date.now
-    }
-});
-
-const ReplicaSchema = new mongoose.Schema({
-    deploymentId: mongoose.Schema.Types.ObjectId,
-    status: {
-        type: String,
-        enum: ['pending', 'active', 'failed', 'removing'],
-        default: 'pending'
-    },
-    replicaNumber: Number,
-    metrics: {
-        cpuUsage: Number,
-        memoryUsage: Number
-    },
-    createdAt: {
-        type: Date,
-        default: Date.now
-    }
-});
-
-const Worker = mongoose.model('Worker', WorkerSchema);
-const Deployment = mongoose.model('Deployment', DeploymentSchema);
-const Replica = mongoose.model('Replica', ReplicaSchema);
 
 class DeploymentOrchestrator {
     constructor() {
         this.io = null;
+        this.redis = redis;
         this.deploymentPath = process.env.DEPLOYMENT_PATH || './deployments';
         this.ensureDeploymentPath();
+
+        // Constants
+        this.KEYS = {
+            WORKER: 'worker:',
+            DEPLOYMENT: 'deployment:',
+            REPLICA: 'replica:',
+            COUNTER: 'counter:',
+            SET: {
+                WORKERS: 'workers',
+                DEPLOYMENTS: 'deployments',
+                REPLICAS: 'replicas'
+            }
+        };
 
         // Intervals and timeouts
         this.cleanupInterval = 60 * 1000; // 1 minute
@@ -101,12 +56,19 @@ class DeploymentOrchestrator {
         }
     }
 
+    async getNextId(type) {
+        return await this.redis.incr(`${this.KEYS.COUNTER}${type}`);
+    }
+
     async startScalingMonitor() {
         setInterval(async () => {
             try {
-                const deployments = await Deployment.find({ status: 'active' });
-                for (const deployment of deployments) {
-                    await this.checkAndScale(deployment);
+                const deploymentIds = await this.redis.smembers(this.KEYS.SET.DEPLOYMENTS);
+                for (const deploymentId of deploymentIds) {
+                    const deployment = await this.getDeployment(deploymentId);
+                    if (deployment && deployment.status === 'active') {
+                        await this.checkAndScale(deployment);
+                    }
                 }
             } catch (error) {
                 console.error('Error in scaling monitor:', error);
@@ -114,11 +76,23 @@ class DeploymentOrchestrator {
         }, this.scalingSettings.checkInterval);
     }
 
+    async getDeployment(deploymentId) {
+        const data = await this.redis.get(`${this.KEYS.DEPLOYMENT}${deploymentId}`);
+        return data ? JSON.parse(data) : null;
+    }
+
     async checkAndScale(deployment) {
         try {
-            const replicas = await Replica.find({ deploymentId: deployment._id });
-            const currentReplicaCount = replicas.length;
-            const activeReplicas = replicas.filter(r => r.status === 'active');
+            const replicaIds = await this.redis.smembers(
+                `${this.KEYS.DEPLOYMENT}${deployment.id}:replicas`
+            );
+            const replicas = await Promise.all(
+                replicaIds.map(id => this.redis.get(`${this.KEYS.REPLICA}${id}`))
+            );
+
+            const activeReplicas = replicas
+                .map(r => JSON.parse(r))
+                .filter(r => r.status === 'active');
 
             let totalCpuLoad = 0;
             activeReplicas.forEach(replica => {
@@ -128,116 +102,138 @@ class DeploymentOrchestrator {
             const avgCpuLoad = activeReplicas.length > 0 ?
                 totalCpuLoad / activeReplicas.length : 0;
 
-            console.log(`[${new Date().toISOString()}] Deployment ${deployment._id} - Average CPU Load: ${avgCpuLoad}%`);
+            console.log(`[${new Date().toISOString()}] Deployment ${deployment.id} - Average CPU Load: ${avgCpuLoad}%`);
 
             const now = Date.now();
             if (avgCpuLoad > this.scalingSettings.cpuThreshold &&
-                currentReplicaCount < deployment.maxReplicas &&
+                replicas.length < deployment.maxReplicas &&
                 (!deployment.lastScaleUp ||
-                    (now - deployment.lastScaleUp.getTime() > this.scalingSettings.scaleUpCooldown))) {
+                    (now - deployment.lastScaleUp > this.scalingSettings.scaleUpCooldown))) {
                 await this.scaleUp(deployment);
             } else if (avgCpuLoad < this.scalingSettings.cpuThreshold / 2 &&
-                currentReplicaCount > deployment.minReplicas &&
+                replicas.length > deployment.minReplicas &&
                 (!deployment.lastScaleDown ||
-                    (now - deployment.lastScaleDown.getTime() > this.scalingSettings.scaleDownCooldown))) {
+                    (now - deployment.lastScaleDown > this.scalingSettings.scaleDownCooldown))) {
                 await this.scaleDown(deployment);
             }
         } catch (error) {
-            console.error(`Error checking scaling for deployment ${deployment._id}:`, error);
+            console.error(`Error checking scaling for deployment ${deployment.id}:`, error);
         }
+    }
+
+    async findAvailableWorker() {
+        const workers = await this.redis.smembers(this.KEYS.SET.WORKERS);
+        for (const workerId of workers) {
+            const workerData = await this.redis.get(`${this.KEYS.WORKER}${workerId}`);
+            if (workerData) {
+                const worker = JSON.parse(workerData);
+                if (worker.status === 'active' && worker.currentLoad.cpuUsage < 80) {
+                    return worker;
+                }
+            }
+        }
+        return null;
     }
 
     async scaleUp(deployment) {
         try {
-            console.log(`[${new Date().toISOString()}] Scaling up deployment ${deployment._id}`);
+            console.log(`[${new Date().toISOString()}] Scaling up deployment ${deployment.id}`);
 
             const worker = await this.findAvailableWorker();
             if (!worker) {
                 throw new Error('No available workers found');
             }
 
-            const newReplica = new Replica({
-                deploymentId: deployment._id,
+            const replicaId = await this.getNextId('replica');
+            const replica = {
+                id: replicaId,
+                deploymentId: deployment.id,
                 status: 'pending',
                 replicaNumber: deployment.workers.length + 1
-            });
-            await newReplica.save();
+            };
 
-            deployment.lastScaleUp = new Date();
+            await this.redis.set(
+                `${this.KEYS.REPLICA}${replicaId}`,
+                JSON.stringify(replica)
+            );
+            await this.redis.sadd(
+                `${this.KEYS.DEPLOYMENT}${deployment.id}:replicas`,
+                replicaId
+            );
+
+            deployment.lastScaleUp = Date.now();
             deployment.workers.push({
-                workerId: worker._id,
-                replicaId: newReplica.replicaNumber,
+                workerId: worker.id,
+                replicaId: replica.replicaNumber,
                 status: 'pending'
             });
-            await deployment.save();
+
+            await this.redis.set(
+                `${this.KEYS.DEPLOYMENT}${deployment.id}`,
+                JSON.stringify(deployment)
+            );
 
             this.io.to(worker.socketId).emit('deploymentTask', {
-                deploymentId: deployment._id,
-                replicaId: newReplica.replicaNumber,
+                deploymentId: deployment.id,
+                replicaId: replica.replicaNumber,
                 githubRepo: deployment.githubRepo,
                 deploymentTime: new Date().toISOString()
             });
 
         } catch (error) {
-            console.error(`Error scaling up deployment ${deployment._id}:`, error);
+            console.error(`Error scaling up deployment ${deployment.id}:`, error);
         }
     }
 
     async scaleDown(deployment) {
         try {
-            console.log(`[${new Date().toISOString()}] Scaling down deployment ${deployment._id}`);
+            console.log(`[${new Date().toISOString()}] Scaling down deployment ${deployment.id}`);
 
             const lastWorker = deployment.workers[deployment.workers.length - 1];
             if (!lastWorker) return;
 
-            const worker = await Worker.findById(lastWorker.workerId);
-            if (!worker) return;
+            const workerData = await this.redis.get(`${this.KEYS.WORKER}${lastWorker.workerId}`);
+            if (!workerData) return;
+            const worker = JSON.parse(workerData);
 
             this.io.to(worker.socketId).emit('removeReplica', {
-                deploymentId: deployment._id,
+                deploymentId: deployment.id,
                 replicaId: lastWorker.replicaId
             });
 
-            deployment.lastScaleDown = new Date();
-            deployment.workers = deployment.workers.slice(0, -1);
-            await deployment.save();
-
-            await Replica.findOneAndUpdate(
-                { deploymentId: deployment._id, replicaNumber: lastWorker.replicaId },
-                { status: 'removing' }
+            deployment.lastScaleDown = Date.now();
+            deployment.workers.pop();
+            await this.redis.set(
+                `${this.KEYS.DEPLOYMENT}${deployment.id}`,
+                JSON.stringify(deployment)
             );
 
-        } catch (error) {
-            console.error(`Error scaling down deployment ${deployment._id}:`, error);
-        }
-    }
+            await this.redis.srem(
+                `${this.KEYS.DEPLOYMENT}${deployment.id}:replicas`,
+                lastWorker.replicaId
+            );
+            await this.redis.del(`${this.KEYS.REPLICA}${lastWorker.replicaId}`);
 
-    async findAvailableWorker() {
-        return await Worker.findOne({
-            status: 'active',
-            'currentLoad.cpuUsage': { $lt: 80 }
-        }).sort({ 'currentLoad.cpuUsage': 1 });
+        } catch (error) {
+            console.error(`Error scaling down deployment ${deployment.id}:`, error);
+        }
     }
 
     async cleanupInactiveWorkers() {
         try {
-            const cutoffTime = new Date(Date.now() - this.inactiveTimeout);
-            const inactiveWorkers = await Worker.find({
-                $or: [
-                    { lastHeartbeat: { $lt: cutoffTime } },
-                    { status: 'inactive' }
-                ]
-            });
+            const workers = await this.redis.smembers(this.KEYS.SET.WORKERS);
+            const cutoffTime = Date.now() - this.inactiveTimeout;
 
-            if (inactiveWorkers.length > 0) {
-                console.log(`[${new Date().toISOString()}] Found inactive workers:`,
-                    inactiveWorkers.map(w => w.hostname));
-
-                await Worker.deleteMany({
-                    _id: { $in: inactiveWorkers.map(w => w._id) }
-                });
-
-                console.log(`Cleaned up ${inactiveWorkers.length} inactive workers`);
+            for (const workerId of workers) {
+                const workerData = await this.redis.get(`${this.KEYS.WORKER}${workerId}`);
+                if (workerData) {
+                    const worker = JSON.parse(workerData);
+                    if (worker.lastHeartbeat < cutoffTime || worker.status === 'inactive') {
+                        await this.redis.srem(this.KEYS.SET.WORKERS, workerId);
+                        await this.redis.del(`${this.KEYS.WORKER}${workerId}`);
+                        console.log(`Cleaned up inactive worker: ${worker.hostname}`);
+                    }
+                }
             }
         } catch (error) {
             console.error('Error cleaning up inactive workers:', error);
@@ -250,39 +246,26 @@ class DeploymentOrchestrator {
         this.io.on('connection', (socket) => {
             console.log(`[${new Date().toISOString()}] Worker connected: ${socket.id}`);
 
-            let heartbeatTimeout;
-            const resetHeartbeatTimeout = () => {
-                if (heartbeatTimeout) clearTimeout(heartbeatTimeout);
-                heartbeatTimeout = setTimeout(async () => {
-                    if (socket.workerId) {
-                        try {
-                            await Worker.findByIdAndUpdate(socket.workerId,
-                                { status: 'inactive', socketId: null });
-                            console.log(`Worker ${socket.workerId} marked inactive due to missing heartbeat`);
-                        } catch (error) {
-                            console.error('Error updating worker status:', error);
-                        }
-                    }
-                }, this.inactiveTimeout);
-            };
-
             socket.on('registerWorker', async (workerData) => {
                 try {
-                    await Worker.deleteMany({ hostname: workerData.hostname });
-
-                    const worker = new Worker({
+                    const workerId = await this.getNextId('worker');
+                    const worker = {
+                        id: workerId,
                         hostname: workerData.hostname,
                         socketId: socket.id,
                         status: 'active',
-                        lastHeartbeat: new Date()
-                    });
+                        lastHeartbeat: Date.now()
+                    };
 
-                    await worker.save();
-                    socket.workerId = worker._id;
-                    socket.emit('workerRegistered', { id: worker._id });
+                    await this.redis.set(
+                        `${this.KEYS.WORKER}${workerId}`,
+                        JSON.stringify(worker)
+                    );
+                    await this.redis.sadd(this.KEYS.SET.WORKERS, workerId);
 
-                    console.log(`[${new Date().toISOString()}] Worker registered:`, worker.hostname);
-                    resetHeartbeatTimeout();
+                    socket.workerId = workerId;
+                    socket.emit('workerRegistered', { id: workerId });
+
                 } catch (error) {
                     console.error('Error during worker registration:', error);
                     socket.emit('error', error.message);
@@ -291,13 +274,18 @@ class DeploymentOrchestrator {
 
             socket.on('workerStatus', async (statusUpdate) => {
                 try {
-                    const worker = await Worker.findById(statusUpdate.workerId);
-                    if (worker) {
+                    const workerData = await this.redis.get(
+                        `${this.KEYS.WORKER}${statusUpdate.workerId}`
+                    );
+                    if (workerData) {
+                        const worker = JSON.parse(workerData);
                         worker.status = statusUpdate.status;
                         worker.currentLoad = statusUpdate.load;
-                        worker.lastHeartbeat = new Date();
-                        await worker.save();
-                        resetHeartbeatTimeout();
+                        worker.lastHeartbeat = Date.now();
+                        await this.redis.set(
+                            `${this.KEYS.WORKER}${statusUpdate.workerId}`,
+                            JSON.stringify(worker)
+                        );
                     }
                 } catch (error) {
                     console.error('Error updating worker status:', error);
@@ -306,7 +294,7 @@ class DeploymentOrchestrator {
 
             socket.on('deploymentStatus', async (statusUpdate) => {
                 try {
-                    const deployment = await Deployment.findById(statusUpdate.deploymentId);
+                    const deployment = await this.getDeployment(statusUpdate.deploymentId);
                     if (deployment) {
                         const workerIndex = deployment.workers.findIndex(
                             w => w.replicaId.toString() === statusUpdate.replicaId.toString()
@@ -314,19 +302,20 @@ class DeploymentOrchestrator {
 
                         if (workerIndex !== -1) {
                             deployment.workers[workerIndex].status = statusUpdate.status;
-                            await deployment.save();
+                            await this.redis.set(
+                                `${this.KEYS.DEPLOYMENT}${statusUpdate.deploymentId}`,
+                                JSON.stringify(deployment)
+                            );
                         }
 
-                        await Replica.findOneAndUpdate(
-                            {
-                                deploymentId: statusUpdate.deploymentId,
-                                replicaNumber: statusUpdate.replicaId
-                            },
-                            {
-                                status: statusUpdate.status,
-                                metrics: statusUpdate.metrics
-                            }
-                        );
+                        const replicaKey = `${this.KEYS.REPLICA}${statusUpdate.replicaId}`;
+                        const replicaData = await this.redis.get(replicaKey);
+                        if (replicaData) {
+                            const replica = JSON.parse(replicaData);
+                            replica.status = statusUpdate.status;
+                            replica.metrics = statusUpdate.metrics;
+                            await this.redis.set(replicaKey, JSON.stringify(replica));
+                        }
                     }
                 } catch (error) {
                     console.error('Error updating deployment status:', error);
@@ -336,13 +325,13 @@ class DeploymentOrchestrator {
             socket.on('disconnect', async () => {
                 if (socket.workerId) {
                     try {
-                        await Worker.findByIdAndDelete(socket.workerId);
-                        console.log(`[${new Date().toISOString()}] Worker ${socket.workerId} disconnected and removed`);
+                        await this.redis.srem(this.KEYS.SET.WORKERS, socket.workerId);
+                        await this.redis.del(`${this.KEYS.WORKER}${socket.workerId}`);
+                        console.log(`Worker ${socket.workerId} disconnected and removed`);
                     } catch (error) {
                         console.error('Error removing disconnected worker:', error);
                     }
                 }
-                if (heartbeatTimeout) clearTimeout(heartbeatTimeout);
             });
         });
 
@@ -374,40 +363,68 @@ class DeploymentOrchestrator {
             throw new Error('Invalid repository');
         }
 
-        const workers = await Worker.find({
-            status: 'active',
-            'currentLoad.cpuUsage': { $lt: 80 }
-        }).sort({ 'currentLoad.cpuUsage': 1 }).limit(maxReplicas);
+        const workers = await Promise.all(
+            (await this.redis.smembers(this.KEYS.SET.WORKERS))
+                .map(async workerId => {
+                    const workerData = await this.redis.get(`${this.KEYS.WORKER}${workerId}`);
+                    return workerData ? JSON.parse(workerData) : null;
+                })
+        );
 
-        if (workers.length < minReplicas) {
-            throw new Error(`Insufficient active workers. Required: ${minReplicas}, Available: ${workers.length}`);
+        const activeWorkers = workers.filter(worker =>
+            worker &&
+            worker.status === 'active' &&
+            worker.currentLoad.cpuUsage < 80
+        );
+
+        if (activeWorkers.length < minReplicas) {
+            throw new Error(`Insufficient active workers. Required: ${minReplicas}, Available: ${activeWorkers.length}`);
         }
 
-        const deployment = new Deployment({
+        const deploymentId = await this.getNextId('deployment');
+        const deployment = {
+            id: deploymentId,
             githubRepo,
             userName,
             minReplicas,
             maxReplicas,
             status: 'deploying',
-            workers: workers.slice(0, minReplicas).map((worker, index) => ({
-                workerId: worker._id,
+            workers: activeWorkers.slice(0, minReplicas).map((worker, index) => ({
+                workerId: worker.id,
                 replicaId: index + 1,
                 status: 'pending'
-            }))
-        });
+            })),
+            createdAt: Date.now()
+        };
 
-        await deployment.save();
+        await this.redis.set(
+            `${this.KEYS.DEPLOYMENT}${deploymentId}`,
+            JSON.stringify(deployment)
+        );
+        await this.redis.sadd(this.KEYS.SET.DEPLOYMENTS, deploymentId);
 
-        // Создаем начальные реплики
+        // Create initial replicas
         for (let i = 0; i < minReplicas; i++) {
-            await new Replica({
-                deploymentId: deployment._id,
+            const replicaId = await this.getNextId('replica');
+            const replica = {
+                id: replicaId,
+                deploymentId: deploymentId,
                 status: 'pending',
-                replicaNumber: i + 1
-            }).save();
+                replicaNumber: i + 1,
+                createdAt: Date.now()
+            };
+
+            await this.redis.set(
+                `${this.KEYS.REPLICA}${replicaId}`,
+                JSON.stringify(replica)
+            );
+            await this.redis.sadd(
+                `${this.KEYS.DEPLOYMENT}${deploymentId}:replicas`,
+                replicaId
+            );
         }
 
-        console.log(`[${new Date().toISOString()}] Deployment created:`, deployment._id);
+        console.log(`[2025-01-28 07:14:53] Deployment created:`, deploymentId);
 
         await this.distributeToWorkers(deployment, repoInfo);
 
@@ -417,31 +434,38 @@ class DeploymentOrchestrator {
     async distributeToWorkers(deployment, repoInfo) {
         try {
             for (const workerRef of deployment.workers) {
-                const worker = await Worker.findById(workerRef.workerId);
-                if (!worker) {
+                const workerData = await this.redis.get(`${this.KEYS.WORKER}${workerRef.workerId}`);
+                if (!workerData) {
                     console.error(`Worker not found: ${workerRef.workerId}`);
                     continue;
                 }
 
-                const deploymentDir = `${this.deploymentPath}/${deployment._id}_${workerRef.replicaId}`;
+                const worker = JSON.parse(workerData);
+                const deploymentDir = `${this.deploymentPath}/${deployment.id}_${workerRef.replicaId}`;
 
                 this.io.to(worker.socketId).emit('deployRepository', {
                     deploymentDir,
                     repoUrl: repoInfo.clone_url,
                     replicaId: workerRef.replicaId,
-                    deploymentId: deployment._id,
+                    deploymentId: deployment.id,
                     deploymentTime: new Date().toISOString()
                 });
 
-                console.log(`[${new Date().toISOString()}] Deployment task sent to worker:`, worker.hostname);
+                console.log(`[2025-01-28 07:14:53] Deployment task sent to worker:`, worker.hostname);
             }
 
             deployment.status = 'active';
-            await deployment.save();
+            await this.redis.set(
+                `${this.KEYS.DEPLOYMENT}${deployment.id}`,
+                JSON.stringify(deployment)
+            );
         } catch (error) {
             console.error('Error during deployment distribution:', error);
             deployment.status = 'failed';
-            await deployment.save();
+            await this.redis.set(
+                `${this.KEYS.DEPLOYMENT}${deployment.id}`,
+                JSON.stringify(deployment)
+            );
             throw error;
         }
     }
@@ -451,14 +475,13 @@ class DeploymentOrchestrator {
 const app = express();
 const server = http.createServer(app);
 
-// MongoDB connection
-mongoose.connect('mongodb://localhost:27017/deployment_system', {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-}).then(() => {
-    console.log('[2025-01-23 19:17:21] Connected to MongoDB');
-}).catch(err => {
-    console.error('MongoDB connection error:', err);
+// Initialize Redis and orchestrator
+redis.on('connect', () => {
+    console.log('[2025-01-28 07:14:53] Connected to Redis');
+});
+
+redis.on('error', (err) => {
+    console.error('Redis connection error:', err);
 });
 
 // Initialize orchestrator
@@ -481,10 +504,14 @@ app.post('/deploy', async (req, res) => {
 
 app.get('/deployments', async (req, res) => {
     try {
-        const deployments = await Deployment.find()
-            .sort({ createdAt: -1 })
-            .limit(10);
-        res.json(deployments);
+        const deploymentIds = await redis.smembers(orchestrator.KEYS.SET.DEPLOYMENTS);
+        const deployments = await Promise.all(
+            deploymentIds.map(async id => {
+                const data = await redis.get(`${orchestrator.KEYS.DEPLOYMENT}${id}`);
+                return data ? JSON.parse(data) : null;
+            })
+        );
+        res.json(deployments.filter(Boolean).sort((a, b) => b.createdAt - a.createdAt).slice(0, 10));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -492,11 +519,11 @@ app.get('/deployments', async (req, res) => {
 
 app.get('/deployment/:id', async (req, res) => {
     try {
-        const deployment = await Deployment.findById(req.params.id);
+        const deployment = await redis.get(`${orchestrator.KEYS.DEPLOYMENT}${req.params.id}`);
         if (!deployment) {
             return res.status(404).json({ error: 'Deployment not found' });
         }
-        res.json(deployment);
+        res.json(JSON.parse(deployment));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -504,9 +531,14 @@ app.get('/deployment/:id', async (req, res) => {
 
 app.get('/workers', async (req, res) => {
     try {
-        const workers = await Worker.find()
-            .sort({ lastHeartbeat: -1 });
-        res.json(workers);
+        const workerIds = await redis.smembers(orchestrator.KEYS.SET.WORKERS);
+        const workers = await Promise.all(
+            workerIds.map(async id => {
+                const data = await redis.get(`${orchestrator.KEYS.WORKER}${id}`);
+                return data ? JSON.parse(data) : null;
+            })
+        );
+        res.json(workers.filter(Boolean).sort((a, b) => b.lastHeartbeat - a.lastHeartbeat));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -514,9 +546,16 @@ app.get('/workers', async (req, res) => {
 
 app.get('/replicas/:deploymentId', async (req, res) => {
     try {
-        const replicas = await Replica.find({ deploymentId: req.params.deploymentId })
-            .sort({ replicaNumber: 1 });
-        res.json(replicas);
+        const replicaIds = await redis.smembers(
+            `${orchestrator.KEYS.DEPLOYMENT}${req.params.deploymentId}:replicas`
+        );
+        const replicas = await Promise.all(
+            replicaIds.map(async id => {
+                const data = await redis.get(`${orchestrator.KEYS.REPLICA}${id}`);
+                return data ? JSON.parse(data) : null;
+            })
+        );
+        res.json(replicas.filter(Boolean).sort((a, b) => a.replicaNumber - b.replicaNumber));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -534,13 +573,13 @@ app.use((err, req, res, next) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`[2025-01-23 19:17:21] Main server running on port ${PORT}`);
+    console.log(`[2025-01-28 07:14:53] Main server running on port ${PORT}`);
 });
 
 // Handle process termination
 process.on('SIGTERM', async () => {
     console.log('Received SIGTERM. Shutting down gracefully...');
-    await mongoose.connection.close();
+    await redis.quit();
     server.close(() => {
         console.log('Server closed. Process terminated.');
         process.exit(0);
@@ -549,7 +588,7 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
     console.log('Received SIGINT. Shutting down gracefully...');
-    await mongoose.connection.close();
+    await redis.quit();
     server.close(() => {
         console.log('Server closed. Process terminated.');
         process.exit(0);
